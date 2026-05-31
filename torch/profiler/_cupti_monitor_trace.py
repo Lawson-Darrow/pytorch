@@ -48,6 +48,7 @@ _MEMORY_KIND_NAMES = {
 
 _FLOW_CATEGORY = "ac2g"
 _OVERHEAD_PID = -1
+_USER_EXTERNAL_CORRELATION_KIND = int(_mon._cc.ExternalCorrelationKind.CUSTOM1)
 _CBID_NAME_RE = re.compile(r"^\s*[A-Z0-9_]+_(?P<name>[A-Za-z0-9_]+)\s*=\s*(?P<value>\d+),")
 _RUNTIME_CBID_HEADER = Path("/usr/local/cuda/include/cupti_runtime_cbid.h")
 _DRIVER_CBID_HEADER = Path("/usr/local/cuda/include/cupti_driver_cbid.h")
@@ -500,7 +501,81 @@ def _trace_window_entries(
                 }
             )
 
+    trace_events.extend(
+        _gpu_user_annotation_events(
+            trace_window,
+            base_ns=base_ns,
+        )
+    )
+
     return metadata_events, trace_events
+
+
+def _gpu_user_annotation_events(
+    trace_window: dict[str, object],
+    *,
+    base_ns: int,
+) -> list[dict[str, object]]:
+    user_annotations = trace_window.get("user_annotations", {})
+    if not isinstance(user_annotations, dict) or not user_annotations:
+        return []
+    trace_window_events = trace_window["events"]
+
+    correlation_to_user_external: dict[int, int] = {}
+    for event in trace_window_events:
+        if event.get("kind") != "external_correlation":
+            continue
+        if int(event.get("external_kind", 0)) != _USER_EXTERNAL_CORRELATION_KIND:
+            continue
+        external_id = int(event.get("external_id", 0))
+        correlation_id = int(event.get("correlation_id", 0))
+        if external_id in user_annotations and correlation_id != 0:
+            correlation_to_user_external[correlation_id] = external_id
+
+    if not correlation_to_user_external:
+        return []
+
+    span_map: dict[tuple[int, int, int], dict[str, int]] = {}
+    for event in trace_window_events:
+        if event.get("kind") not in {"kernel", "gpu_memcpy", "gpu_memset"}:
+            continue
+        correlation_id = int(event.get("correlation_id", 0))
+        external_id = correlation_to_user_external.get(correlation_id)
+        if external_id is None:
+            continue
+        device_id = int(event["device_id"])
+        stream_id = int(event["stream_id"])
+        key = (external_id, device_id, stream_id)
+        start_ns = int(event["start_ns"])
+        end_ns = int(event["end_ns"])
+        span = span_map.get(key)
+        if span is None:
+            span_map[key] = {"start_ns": start_ns, "end_ns": end_ns}
+        else:
+            span["start_ns"] = min(span["start_ns"], start_ns)
+            span["end_ns"] = max(span["end_ns"], end_ns)
+
+    gpu_user_events: list[dict[str, object]] = []
+    for (external_id, device_id, stream_id), span in sorted(span_map.items()):
+        name = user_annotations.get(external_id)
+        if not isinstance(name, str):
+            continue
+        start_us = max((span["start_ns"] - base_ns) / 1000.0 - 0.001, 0.0)
+        dur_us = max((span["end_ns"] - span["start_ns"]) / 1000.0 + 0.002, 0.0)
+        gpu_user_events.append(
+            {
+                "ph": "X",
+                "cat": "gpu_user_annotation",
+                "name": name,
+                "pid": device_id,
+                "tid": stream_id,
+                "ts": start_us,
+                "dur": dur_us,
+                "args": {"External id": external_id},
+            }
+        )
+
+    return gpu_user_events
 
 
 def merge_trace_window_into_chrome_trace(
